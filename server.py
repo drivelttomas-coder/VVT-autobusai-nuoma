@@ -2,7 +2,7 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 from pathlib import Path
-import json,csv,io,time,datetime,os
+import json,csv,io,time,datetime,os,sqlite3,threading
 
 ROOT=Path(__file__).resolve().parent
 SOURCE='https://stops.lt/vilnius/gps_full.txt'
@@ -14,6 +14,34 @@ FLEET={
 4706:'NTY501',4707:'NTY502',4708:'NTY507',4709:'NTY506',4710:'NTY499',4711:'NTY504',4712:'NTY503',4713:'NTY498',
 4714:'OAG291',4715:'OBY793',4716:'OBY866',4717:'OBY776',4718:'OBY764',4719:'OBY782',4720:'OBY779'}
 CACHE={'at':0,'data':None}
+DB_PATH=Path(os.environ.get('FLEET_DB_PATH',str(ROOT/'fleet_history.sqlite3')))
+LOCK=threading.RLock()
+STALE_LIMIT=180
+FAULT_LIMIT=48*3600
+
+def history(vehicles, now):
+    # SQLite persists across process restarts only while its filesystem persists.
+    with LOCK:
+        DB_PATH.parent.mkdir(parents=True,exist_ok=True)
+        with sqlite3.connect(DB_PATH,timeout=10) as db:
+            db.execute('CREATE TABLE IF NOT EXISTS gps_history (garage INTEGER PRIMARY KEY, inactive_since REAL, last_active REAL)')
+            for v in vehicles:
+                n=v['garage']
+                row=db.execute('SELECT inactive_since,last_active FROM gps_history WHERE garage=?',(n,)).fetchone()
+                inactive_since,last_active=row if row else (None,None)
+                if v['status'] in ('active','depot'):
+                    inactive_since=None
+                    last_active=now
+                else:
+                    if inactive_since is None:inactive_since=now
+                db.execute('INSERT OR REPLACE INTO gps_history (garage,inactive_since,last_active) VALUES (?,?,?)',(n,inactive_since,last_active))
+                duration=max(0,int(now-inactive_since)) if inactive_since is not None else 0
+                v['inactiveSeconds']=duration if v['status']=='unknown' else None
+                v['inactiveSince']=datetime.datetime.fromtimestamp(inactive_since,datetime.timezone.utc).isoformat() if inactive_since is not None else None
+                v['lastActiveAt']=datetime.datetime.fromtimestamp(last_active,datetime.timezone.utc).isoformat() if last_active is not None else None
+                if v['status']=='unknown' and duration>=FAULT_LIMIT:v['status']='suspected_fault'
+            db.commit()
+
 
 def fetch():
     if CACHE['data'] and time.time()-CACHE['at']<15:return CACHE['data']
@@ -50,7 +78,8 @@ def fetch():
         # Older than 3 minutes is stale; no GPS entry = unknown, not parked.
         v['status']='unknown' if n not in matches or (v['ageSeconds'] is not None and v['ageSeconds']>180) else ('depot' if v['towardDepot'] else 'active')
         vehicles.append(v)
-    result={'updatedAt':datetime.datetime.now(datetime.timezone.utc).isoformat(),'source':SOURCE,'feedRows':len(rows),'vehicles':vehicles,'counts':{'total':len(vehicles),'active':sum(v['status']=='active' for v in vehicles),'depot':sum(v['status']=='depot' for v in vehicles),'unknown':sum(v['status']=='unknown' for v in vehicles)}}
+    history(vehicles,time.time())
+    result={'updatedAt':datetime.datetime.now(datetime.timezone.utc).isoformat(),'source':SOURCE,'feedRows':len(rows),'vehicles':vehicles,'counts':{'total':len(vehicles),'active':sum(v['status']=='active' for v in vehicles),'depot':sum(v['status']=='depot' for v in vehicles),'unknown':sum(v['status']=='unknown' for v in vehicles),'suspected_fault':sum(v['status']=='suspected_fault' for v in vehicles)}}
     CACHE.update(at=time.time(),data=result)
     return result
 
