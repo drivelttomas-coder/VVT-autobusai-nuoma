@@ -2,7 +2,8 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 from pathlib import Path
-import json,csv,io,time,datetime,os,sqlite3,threading
+import json,csv,io,time,datetime,os,sqlite3,threading,math
+from zoneinfo import ZoneInfo
 
 ROOT=Path(__file__).resolve().parent
 SOURCE='https://stops.lt/vilnius/gps_full.txt'
@@ -18,9 +19,29 @@ DB_PATH=Path(os.environ.get('FLEET_DB_PATH',str(ROOT/'fleet_history.sqlite3')))
 LOCK=threading.RLock()
 STALE_LIMIT=180
 FAULT_LIMIT=48*3600
+POLL_SECONDS=30
+MAX_GAP_SECONDS=120
+MAX_SPEED_KMH=100
+
+LOCAL_TZ=ZoneInfo('Europe/Vilnius')
+
+def weekday_seconds(start, end):
+    """Count elapsed seconds on Lithuania-local Mon-Fri, including full weekdays."""
+    if start is None or end <= start:
+        return 0
+    cursor=datetime.datetime.fromtimestamp(start, LOCAL_TZ)
+    finish=datetime.datetime.fromtimestamp(end, LOCAL_TZ)
+    seconds=0.0
+    while cursor < finish:
+        next_day=datetime.datetime.combine(cursor.date()+datetime.timedelta(days=1),datetime.time.min,tzinfo=LOCAL_TZ)
+        segment_end=min(next_day,finish)
+        if cursor.weekday()<5:
+            seconds += (segment_end.timestamp()-cursor.timestamp())
+        cursor=segment_end
+    return max(0,int(seconds))
 
 def history(vehicles, now):
-    # SQLite persists across process restarts only while its filesystem persists.
+    # SQLite on Render Free is ephemeral. Configure durable storage for reliable history.
     with LOCK:
         DB_PATH.parent.mkdir(parents=True,exist_ok=True)
         with sqlite3.connect(DB_PATH,timeout=10) as db:
@@ -32,16 +53,60 @@ def history(vehicles, now):
                 if v['status'] in ('active','depot'):
                     inactive_since=None
                     last_active=now
-                else:
-                    if inactive_since is None:inactive_since=now
+                elif inactive_since is None:
+                    inactive_since=now
                 db.execute('INSERT OR REPLACE INTO gps_history (garage,inactive_since,last_active) VALUES (?,?,?)',(n,inactive_since,last_active))
-                duration=max(0,int(now-inactive_since)) if inactive_since is not None else 0
+                duration=weekday_seconds(inactive_since,now) if inactive_since is not None else 0
                 v['inactiveSeconds']=duration if v['status']=='unknown' else None
                 v['inactiveSince']=datetime.datetime.fromtimestamp(inactive_since,datetime.timezone.utc).isoformat() if inactive_since is not None else None
                 v['lastActiveAt']=datetime.datetime.fromtimestamp(last_active,datetime.timezone.utc).isoformat() if last_active is not None else None
-                if v['status']=='unknown' and duration>=FAULT_LIMIT:v['status']='suspected_fault'
-            db.commit()
+                v['weekendPaused']=datetime.datetime.fromtimestamp(now,LOCAL_TZ).weekday()>=5 and v['status']=='unknown'
+                if v['status']=='unknown' and duration>=FAULT_LIMIT:
+                    v['status']='suspected_fault'
 
+
+
+def haversine_km(a,b,c,d):
+    r=6371.0088
+    p1,p2=math.radians(a),math.radians(c)
+    dp=p2-p1;dl=math.radians(d-b)
+    x=math.sin(dp/2)**2+math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+    return 2*r*math.asin(min(1,math.sqrt(x)))
+
+def mileage(vehicles,now):
+    """Accumulate unique, fresh GPS observations, not repeated page requests."""
+    today=datetime.datetime.fromtimestamp(now,LOCAL_TZ).date()
+    week_start=today-datetime.timedelta(days=today.weekday())
+    month_start=today.replace(day=1)
+    with LOCK:
+        with sqlite3.connect(DB_PATH,timeout=10) as db:
+            db.execute('CREATE TABLE IF NOT EXISTS mileage_points (garage INTEGER PRIMARY KEY, observed_ts REAL, latitude REAL, longitude REAL)')
+            db.execute('CREATE TABLE IF NOT EXISTS mileage_daily (garage INTEGER, day TEXT, km REAL NOT NULL DEFAULT 0, PRIMARY KEY (garage,day))')
+            for v in vehicles:
+                n=v['garage'];lat=v.get('latitude');lon=v.get('longitude');age=v.get('ageSeconds')
+                if v['status'] in ('active','depot') and lat is not None and lon is not None and age is not None and 0<=age<=STALE_LIMIT:
+                    observed=round(now-age)
+                    previous=db.execute('SELECT observed_ts,latitude,longitude FROM mileage_points WHERE garage=?',(n,)).fetchone()
+                    if previous is None or observed>previous[0]:
+                        if previous:
+                            delta=observed-previous[0]
+                            if 0<delta<=MAX_GAP_SECONDS:
+                                km=haversine_km(previous[1],previous[2],lat,lon)
+                                if km>=0.015 and km/delta*3600<=MAX_SPEED_KMH:
+                                    day=datetime.datetime.fromtimestamp(observed,LOCAL_TZ).date().isoformat()
+                                    db.execute('INSERT INTO mileage_daily (garage,day,km) VALUES (?,?,?) ON CONFLICT(garage,day) DO UPDATE SET km=km+excluded.km',(n,day,km))
+                        db.execute('INSERT OR REPLACE INTO mileage_points (garage,observed_ts,latitude,longitude) VALUES (?,?,?,?)',(n,observed,lat,lon))
+            rows=db.execute('SELECT garage,day,km FROM mileage_daily').fetchall()
+    totals={n:{'today':0.,'week':0.,'month':0.,'all':0.} for n in FLEET}
+    for n,day,km in rows:
+        if n not in totals:continue
+        d=datetime.date.fromisoformat(day)
+        totals[n]['all']+=km
+        if d==today:totals[n]['today']+=km
+        if d>=week_start:totals[n]['week']+=km
+        if d>=month_start:totals[n]['month']+=km
+    for v in vehicles:v['mileageKm']={k:round(val,2) for k,val in totals[v['garage']].items()}
+    return {k:round(sum(x[k] for x in totals.values()),2) for k in ('today','week','month','all')}
 
 def fetch():
     if CACHE['data'] and time.time()-CACHE['at']<15:return CACHE['data']
@@ -78,14 +143,22 @@ def fetch():
         # Older than 3 minutes is stale; no GPS entry = unknown, not parked.
         v['status']='unknown' if n not in matches or (v['ageSeconds'] is not None and v['ageSeconds']>180) else ('depot' if v['towardDepot'] else 'active')
         vehicles.append(v)
-    history(vehicles,time.time())
-    result={'updatedAt':datetime.datetime.now(datetime.timezone.utc).isoformat(),'source':SOURCE,'feedRows':len(rows),'vehicles':vehicles,'counts':{'total':len(vehicles),'active':sum(v['status']=='active' for v in vehicles),'depot':sum(v['status']=='depot' for v in vehicles),'unknown':sum(v['status']=='unknown' for v in vehicles),'suspected_fault':sum(v['status']=='suspected_fault' for v in vehicles)}}
+    now=time.time()
+    history(vehicles,now)
+    mileage_totals=mileage(vehicles,now)
+    result={'updatedAt':datetime.datetime.now(datetime.timezone.utc).isoformat(),'source':SOURCE,'feedRows':len(rows),'vehicles':vehicles,'mileageTotalsKm':mileage_totals,'counts':{'total':len(vehicles),'active':sum(v['status']=='active' for v in vehicles),'depot':sum(v['status']=='depot' for v in vehicles),'unknown':sum(v['status']=='unknown' for v in vehicles),'suspected_fault':sum(v['status']=='suspected_fault' for v in vehicles)}}
     CACHE.update(at=time.time(),data=result)
     return result
 
 def is_summer():
     from zoneinfo import ZoneInfo
     return datetime.datetime.now(ZoneInfo('Europe/Vilnius')).utcoffset().total_seconds()==10800
+
+def poll_loop():
+    while True:
+        try:fetch()
+        except Exception as exc:print('GPS polling:',exc,flush=True)
+        time.sleep(POLL_SECONDS)
 
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self,*args,**kwargs):super().__init__(*args,directory=str(ROOT),**kwargs)
@@ -99,5 +172,6 @@ class Handler(SimpleHTTPRequestHandler):
 
 if __name__=='__main__':
     port=int(os.environ.get('PORT','8080'))
+    threading.Thread(target=poll_loop,daemon=True).start()
     print('READY1 Fleet http://localhost:'+str(port),flush=True)
     ThreadingHTTPServer(('0.0.0.0',port),Handler).serve_forever()
