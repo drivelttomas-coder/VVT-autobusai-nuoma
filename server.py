@@ -19,8 +19,10 @@ DB_PATH=Path(os.environ.get('FLEET_DB_PATH',str(ROOT/'fleet_history.sqlite3')))
 LOCK=threading.RLock()
 STALE_LIMIT=180
 FAULT_LIMIT=48*3600
-POLL_SECONDS=30
+POLL_SECONDS=int(os.environ.get("GPS_POLL_SECONDS", "5"))
 MAX_GAP_SECONDS=120
+CACHE_SECONDS=max(1,min(POLL_SECONDS-1,4))
+FETCH_LOCK=threading.Lock()
 MAX_SPEED_KMH=100
 
 LOCAL_TZ=ZoneInfo('Europe/Vilnius')
@@ -82,19 +84,29 @@ def mileage(vehicles,now):
         with sqlite3.connect(DB_PATH,timeout=10) as db:
             db.execute('CREATE TABLE IF NOT EXISTS mileage_points (garage INTEGER PRIMARY KEY, observed_ts REAL, latitude REAL, longitude REAL)')
             db.execute('CREATE TABLE IF NOT EXISTS mileage_daily (garage INTEGER, day TEXT, km REAL NOT NULL DEFAULT 0, PRIMARY KEY (garage,day))')
+            db.execute('CREATE TABLE IF NOT EXISTS gps_samples (garage INTEGER NOT NULL, observed_ts REAL NOT NULL, latitude REAL NOT NULL, longitude REAL NOT NULL, speed REAL, received_ts REAL NOT NULL, PRIMARY KEY(garage, observed_ts))')
+            db.execute('CREATE TABLE IF NOT EXISTS gps_quality (garage INTEGER PRIMARY KEY, accepted INTEGER DEFAULT 0, rejected_jump INTEGER DEFAULT 0, rejected_gap INTEGER DEFAULT 0, rejected_noise INTEGER DEFAULT 0)')
             for v in vehicles:
                 n=v['garage'];lat=v.get('latitude');lon=v.get('longitude');age=v.get('ageSeconds')
                 if v['status'] in ('active','depot') and lat is not None and lon is not None and age is not None and 0<=age<=STALE_LIMIT:
                     observed=round(now-age)
                     previous=db.execute('SELECT observed_ts,latitude,longitude FROM mileage_points WHERE garage=?',(n,)).fetchone()
                     if previous is None or observed>previous[0]:
+                        db.execute('INSERT OR IGNORE INTO gps_samples (garage,observed_ts,latitude,longitude,speed,received_ts) VALUES (?,?,?,?,?,?)',(n,observed,lat,lon,v.get('speed'),now))
+                        db.execute('INSERT OR IGNORE INTO gps_quality(garage) VALUES (?)',(n,))
                         if previous:
                             delta=observed-previous[0]
                             if 0<delta<=MAX_GAP_SECONDS:
                                 km=haversine_km(previous[1],previous[2],lat,lon)
                                 if km>=0.015 and km/delta*3600<=MAX_SPEED_KMH:
+                                    db.execute('UPDATE gps_quality SET accepted=accepted+1 WHERE garage=?',(n,))
                                     day=datetime.datetime.fromtimestamp(observed,LOCAL_TZ).date().isoformat()
                                     db.execute('INSERT INTO mileage_daily (garage,day,km) VALUES (?,?,?) ON CONFLICT(garage,day) DO UPDATE SET km=km+excluded.km',(n,day,km))
+                                else:
+                                    col='rejected_noise' if km<0.015 else 'rejected_jump'
+                                    db.execute(f'UPDATE gps_quality SET {col}={col}+1 WHERE garage=?',(n,))
+                            elif delta>MAX_GAP_SECONDS:
+                                db.execute('UPDATE gps_quality SET rejected_gap=rejected_gap+1 WHERE garage=?',(n,))
                         db.execute('INSERT OR REPLACE INTO mileage_points (garage,observed_ts,latitude,longitude) VALUES (?,?,?,?)',(n,observed,lat,lon))
             rows=db.execute('SELECT garage,day,km FROM mileage_daily').fetchall()
     totals={n:{'today':0.,'week':0.,'month':0.,'all':0.} for n in FLEET}
@@ -109,7 +121,12 @@ def mileage(vehicles,now):
     return {k:round(sum(x[k] for x in totals.values()),2) for k in ('today','week','month','all')}
 
 def fetch():
-    if CACHE['data'] and time.time()-CACHE['at']<15:return CACHE['data']
+    if CACHE['data'] and time.time()-CACHE['at']<CACHE_SECONDS:return CACHE['data']
+    with FETCH_LOCK:
+        return _fetch_locked()
+
+def _fetch_locked():
+    if CACHE['data'] and time.time()-CACHE['at']<CACHE_SECONDS:return CACHE['data']
     req=Request(SOURCE,headers={'User-Agent':'READY1Fleet/1.0 (fleet dashboard)','Accept':'text/plain'})
     with urlopen(req,timeout=14) as res:
         raw=res.read(5000000)
@@ -146,13 +163,34 @@ def fetch():
     now=time.time()
     history(vehicles,now)
     mileage_totals=mileage(vehicles,now)
-    result={'updatedAt':datetime.datetime.now(datetime.timezone.utc).isoformat(),'source':SOURCE,'feedRows':len(rows),'vehicles':vehicles,'mileageTotalsKm':mileage_totals,'counts':{'total':len(vehicles),'active':sum(v['status']=='active' for v in vehicles),'depot':sum(v['status']=='depot' for v in vehicles),'unknown':sum(v['status']=='unknown' for v in vehicles),'suspected_fault':sum(v['status']=='suspected_fault' for v in vehicles)}}
+    result={'updatedAt':datetime.datetime.now(datetime.timezone.utc).isoformat(),'source':SOURCE,'feedRows':len(rows),'vehicles':vehicles,'mileageTotalsKm':mileage_totals,'pollSeconds':POLL_SECONDS,'counts':{'total':len(vehicles),'active':sum(v['status']=='active' for v in vehicles),'depot':sum(v['status']=='depot' for v in vehicles),'unknown':sum(v['status']=='unknown' for v in vehicles),'suspected_fault':sum(v['status']=='suspected_fault' for v in vehicles)}}
     CACHE.update(at=time.time(),data=result)
     return result
 
 def is_summer():
     from zoneinfo import ZoneInfo
     return datetime.datetime.now(ZoneInfo('Europe/Vilnius')).utcoffset().total_seconds()==10800
+
+def diagnostics():
+    # Aggregated quality data; historical records are retained for later audits.
+    with LOCK, sqlite3.connect(DB_PATH,timeout=10) as db:
+        try:
+            rows=db.execute('SELECT garage,accepted,rejected_jump,rejected_gap,rejected_noise FROM gps_quality ORDER BY garage').fetchall()
+            samples=db.execute('SELECT garage,COUNT(*),MIN(observed_ts),MAX(observed_ts) FROM gps_samples GROUP BY garage').fetchall()
+            intervals=db.execute('SELECT garage,observed_ts,LAG(observed_ts) OVER(PARTITION BY garage ORDER BY observed_ts) AS prev FROM gps_samples ORDER BY garage,observed_ts DESC').fetchall()
+        except sqlite3.OperationalError:
+            return {'pollSeconds':POLL_SECONDS,'vehicles':{},'message':'Laukiama pirmųjų GPS matavimų'}
+    by={n:{'acceptedSegments':a,'rejectedJumps':j,'longGaps':g,'smallMovements':z} for n,a,j,g,z in rows}
+    for n,count,first,last in samples:
+        by.setdefault(n,{}) .update(samples=count,firstSample=datetime.datetime.fromtimestamp(first,datetime.timezone.utc).isoformat(),lastSample=datetime.datetime.fromtimestamp(last,datetime.timezone.utc).isoformat())
+    gaps={}
+    for n,ts,prev in intervals:
+        if prev is not None and 0<ts-prev<600:
+            gaps.setdefault(n,[]).append(round(ts-prev))
+    for n,values in gaps.items():
+        values.sort()
+        by.setdefault(n,{})['medianGpsIntervalSeconds']=values[len(values)//2]
+    return {'pollSeconds':POLL_SECONDS,'vehicles':by,'warning':'Rida preliminari; be odometro palyginimo 1–3 % paklaida negarantuojama.'}
 
 def poll_loop():
     while True:
@@ -163,6 +201,9 @@ def poll_loop():
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self,*args,**kwargs):super().__init__(*args,directory=str(ROOT),**kwargs)
     def do_GET(self):
+        if self.path.split('?')[0]=='/api/gps-diagnostics':
+            payload=diagnostics();body=json.dumps(payload,ensure_ascii=False).encode()
+            self.send_response(200);self.send_header('Content-Type','application/json; charset=utf-8');self.send_header('Cache-Control','no-store');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body);return
         if self.path.split('?')[0]=='/api/fleet':
             try:payload=fetch();status=200
             except Exception as e:payload={'error':str(e),'vehicles':[]};status=503
